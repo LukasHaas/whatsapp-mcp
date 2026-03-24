@@ -62,6 +62,14 @@ A new `/api/sync` endpoint on the Go bridge allows requesting history sync for s
 
    After approximately 20 days, you will might need to re-authenticate.
 
+   > **Tip:** Run the bridge (and optionally the MCP server) inside a [tmux](https://github.com/tmux/tmux/wiki) session so they keep running after you close your terminal:
+   >
+   > ```bash
+   > tmux new-session -s whatsapp
+   > cd whatsapp-bridge && go run main.go
+   > # Detach with Ctrl-b d — reattach later with: tmux attach -t whatsapp
+   > ```
+
 3. **Connect to the MCP server**
 
    Copy the below json with the appropriate {{PATH}} values:
@@ -121,6 +129,76 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
 Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+
+## Remote MCP via fly.io (WebSocket proxy)
+
+If you want to connect to your local MCP from a remote client (e.g. Claude on the web, a mobile app, or a server-side agent) you can deploy a lightweight WebSocket proxy on [fly.io](https://fly.io) that tunnels MCP traffic to your local machine.
+
+### How it works
+
+```
+Remote client (Claude / agent)
+        │  HTTPS / WSS
+        ▼
+  fly.io WebSocket proxy  ◄──── persistent outbound WS connection ────  Local machine
+                                                                         (tmux session running
+                                                                          whatsapp-bridge + MCP server)
+```
+
+1. Your local machine opens an **outbound** WebSocket connection to the fly.io app (no inbound firewall rules needed).
+2. The fly.io app bridges that connection to remote MCP clients over a public HTTPS/WSS endpoint.
+3. MCP messages flow transparently in both directions.
+
+### Setup
+
+1. **Install the fly CLI and log in**
+
+   ```bash
+   curl -L https://fly.io/install.sh | sh
+   fly auth login
+   ```
+
+2. **Create the proxy app** — you can use any small WebSocket-relay server. A minimal example using [`mcp-remote`](https://github.com/geelen/mcp-remote) as a local-side forwarder:
+
+   ```bash
+   # On your local machine, install mcp-remote
+   npm install -g mcp-remote
+
+   # Start the local MCP server with stdio transport (as usual), then expose it:
+   mcp-remote http://localhost:YOUR_MCP_PORT
+   ```
+
+   For the fly.io side, create a minimal Node/Bun WebSocket relay (see the [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) project for a ready-made Docker image) and deploy it:
+
+   ```bash
+   fly launch --image ghcr.io/sparfenyuk/mcp-proxy:latest --name my-whatsapp-mcp
+   fly deploy
+   ```
+
+3. **Point the local bridge at fly.io** — on your local machine (ideally inside your tmux session) start the tunnel:
+
+   ```bash
+   # Replace <app-name> with your fly.io app name
+   mcp-proxy --mode ws-client wss://<app-name>.fly.dev/mcp
+   ```
+
+   The proxy will maintain a persistent outbound WebSocket connection to fly.io so remote clients can reach your local MCP at any time.
+
+4. **Configure your remote client** — add the fly.io WebSocket URL as an MCP server in your client config:
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "url": "wss://<app-name>.fly.dev/mcp"
+       }
+     }
+   }
+   ```
+
+> **Note:** Keep the local bridge and the tunnel running in your tmux session (see the tmux tip above) so the remote MCP stays reachable.
+
+---
 
 ## Architecture Overview
 
