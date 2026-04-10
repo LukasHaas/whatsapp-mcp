@@ -325,14 +325,17 @@ def list_messages(
             result.append(message)
             
         if include_context and result:
-            # Add context for each message
+            # Add context for each message, deduplicating by message ID + chat_jid
             messages_with_context = []
+            seen = set()
             for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-            
+                context = get_message_context(msg.id, context_before, context_after, chat_jid=msg.chat_jid)
+                for ctx_msg in context.before + [context.message] + context.after:
+                    key = (ctx_msg.id, ctx_msg.chat_jid)
+                    if key not in seen:
+                        seen.add(key)
+                        messages_with_context.append(ctx_msg)
+
             return format_messages_list(messages_with_context, show_chat_info=True)
             
         # Format and display messages without context
@@ -349,20 +352,29 @@ def list_messages(
 def get_message_context(
     message_id: str,
     before: int = 5,
-    after: int = 5
+    after: int = 5,
+    chat_jid: Optional[str] = None
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # Get the target message first
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
-        """, (message_id,))
+        if chat_jid:
+            cursor.execute("""
+                SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+                FROM messages
+                JOIN chats ON messages.chat_jid = chats.jid
+                WHERE messages.id = ? AND messages.chat_jid = ?
+            """, (message_id, chat_jid))
+        else:
+            cursor.execute("""
+                SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+                FROM messages
+                JOIN chats ON messages.chat_jid = chats.jid
+                WHERE messages.id = ?
+            """, (message_id,))
         msg_data = cursor.fetchone()
         
         if not msg_data:
