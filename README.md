@@ -38,7 +38,7 @@ A new `/api/sync` endpoint on the Go bridge allows requesting history sync for s
 - Python 3.6+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using the `send_file` tool.
+- FFmpeg (_optional_) - Only needed for audio messages. If you want to send audio files as playable WhatsApp voice messages, they must be in `.ogg` Opus format. With FFmpeg installed, the MCP server will automatically convert non-Opus audio files. Without FFmpeg, you can still send raw audio files using `send_message` with `media_path`.
 
 ### Steps
 
@@ -223,16 +223,11 @@ Once connected, you can interact with your WhatsApp contacts through Claude, lev
 Claude can access the following tools to interact with WhatsApp:
 
 - **search_contacts**: Search for contacts by name or phone number
-- **list_messages**: Retrieve messages with optional filters and context
+- **list_messages**: Retrieve messages with optional filters (date range, sender, chat, contact, content query) and surrounding context. Use `contact_jid` to find any message involving a person (as sender or in their direct chat)
 - **list_chats**: List available chats with metadata
-- **get_chat**: Get information about a specific chat
-- **get_direct_chat_by_contact**: Find a direct chat with a specific contact
-- **get_contact_chats**: List all chats involving a specific contact
-- **get_last_interaction**: Get the most recent message with a contact
+- **get_chat**: Get chat metadata by JID, phone number, or contact. Provide one of `chat_jid` (exact lookup), `phone_number` (direct chat by phone), or `contact_jid` (all chats involving a person)
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
-- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **send_message**: Send a text message, file, or voice message. Supports `message` (text), `media_path` (file attachment), and `as_audio` (convert to Opus voice message)
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
 ### Media Handling Features
@@ -241,13 +236,13 @@ The MCP server supports both sending and receiving various media types:
 
 #### Media Sending
 
-You can send various media types to your WhatsApp contacts:
+You can send various media types to your WhatsApp contacts using the unified `send_message` tool:
 
-- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type.
-- **Voice Messages**: Use the `send_audio_message` tool to send audio files as playable WhatsApp voice messages.
+- **Images, Videos, Documents**: Use `send_message` with `media_path` to share any supported media type.
+- **Voice Messages**: Use `send_message` with `media_path` and `as_audio=True` to send audio files as playable WhatsApp voice messages.
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
-  - Without FFmpeg, you can still send raw audio files using the `send_file` tool, but they won't appear as playable voice messages.
+  - Without FFmpeg, you can still send raw audio files with `as_audio=False`, but they won't appear as playable voice messages.
 
 #### Media Downloading
 
