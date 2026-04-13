@@ -247,6 +247,7 @@ def format_messages_list(messages: List[Message], show_chat_info: bool = True) -
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
+    phone_number: Optional[str] = None,
     sender_phone_number: Optional[str] = None,
     chat_jid: Optional[str] = None,
     contact_jid: Optional[str] = None,
@@ -287,9 +288,17 @@ def list_messages(
             where_clauses.append("messages.timestamp < ?")
             params.append(before)
 
+        if phone_number:
+            # Match messages in the person's DM chat or sent by them in any chat
+            phone_pattern = f"%{phone_number}%"
+            where_clauses.append("(messages.sender LIKE ? OR chats.jid LIKE ?)")
+            params.extend([phone_pattern, phone_pattern])
+
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+            # Use LIKE to handle both bare numbers and full JID formats
+            phone_pattern = f"%{sender_phone_number}%"
+            where_clauses.append("messages.sender LIKE ?")
+            params.append(phone_pattern)
 
         if chat_jid:
             where_clauses.append("messages.chat_jid = ?")
@@ -330,15 +339,19 @@ def list_messages(
             result.append(message)
             
         if include_context and result:
-            # Add context for each message, deduplicating by message ID + chat_jid
+            # Add context for each message, deduplicating by both ID and timestamp+sender
+            # to handle duplicate DB entries from history sync vs real-time with different IDs
             messages_with_context = []
-            seen = set()
+            seen_ids = set()
+            seen_ts = set()
             for msg in result:
                 context = get_message_context(msg.id, context_before, context_after, chat_jid=msg.chat_jid)
                 for ctx_msg in context.before + [context.message] + context.after:
-                    key = (ctx_msg.id, ctx_msg.chat_jid)
-                    if key not in seen:
-                        seen.add(key)
+                    id_key = (ctx_msg.id, ctx_msg.chat_jid)
+                    ts_key = (ctx_msg.timestamp, ctx_msg.sender, ctx_msg.chat_jid)
+                    if id_key not in seen_ids and ts_key not in seen_ts:
+                        seen_ids.add(id_key)
+                        seen_ts.add(ts_key)
                         messages_with_context.append(ctx_msg)
 
             return format_messages_list(messages_with_context, show_chat_info=True)
