@@ -27,6 +27,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
+    phone_number: Optional[str] = None,
     sender_phone_number: Optional[str] = None,
     chat_jid: Optional[str] = None,
     contact_jid: Optional[str] = None,
@@ -42,7 +43,8 @@ def list_messages(
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
+        phone_number: Optional phone number to filter messages by a person (matches their chat or messages they sent)
+        sender_phone_number: Optional phone number to filter messages by sender only
         chat_jid: Optional chat JID to filter messages by chat
         contact_jid: Optional contact JID to find any message involving this person (as sender or in their direct chat)
         query: Optional search term to filter messages by content
@@ -55,6 +57,7 @@ def list_messages(
     messages = whatsapp_list_messages(
         after=after,
         before=before,
+        phone_number=phone_number,
         sender_phone_number=sender_phone_number,
         chat_jid=chat_jid,
         contact_jid=contact_jid,
