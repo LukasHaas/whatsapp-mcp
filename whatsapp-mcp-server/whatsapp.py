@@ -20,7 +20,26 @@ def normalize_text(text: str) -> str:
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+API_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', '.api_token')
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+
+
+def _read_api_token() -> Optional[str]:
+    """Read the shared secret written by the Go bridge.
+
+    Returns None if the file doesn't exist yet (bridge not started).
+    Callers propagate the resulting HTTP auth failure back to the user.
+    """
+    try:
+        with open(API_TOKEN_PATH, 'r') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _auth_headers() -> dict:
+    token = _read_api_token()
+    return {"X-API-Token": token} if token else {}
 
 
 def _get_whatsmeow_contacts() -> dict:
@@ -723,11 +742,13 @@ def send_message(recipient: str, message: Optional[str] = None, media_path: Opti
         if media_path:
             payload["media_path"] = media_path
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
 
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
+        elif response.status_code == 401:
+            return False, "Bridge rejected API token. Restart whatsapp-bridge and try again."
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
@@ -755,8 +776,8 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
-        
+        response = requests.post(url, json=payload, headers=_auth_headers())
+
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
@@ -766,6 +787,9 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             else:
                 print(f"Download failed: {result.get('message', 'Unknown error')}")
                 return None
+        elif response.status_code == 401:
+            print("Bridge rejected API token. Restart whatsapp-bridge and try again.")
+            return None
         else:
             print(f"Error: HTTP {response.status_code} - {response.text}")
             return None

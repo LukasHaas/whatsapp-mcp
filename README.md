@@ -214,6 +214,20 @@ This application consists of two main components:
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
 
+### Security
+
+The bridge's REST API (port 8080) is hardened as follows:
+
+- **Loopback-only** — the socket binds `127.0.0.1`, so it is not reachable from the LAN/VPN.
+- **Shared-secret auth** — on first run the bridge generates `whatsapp-bridge/store/.api_token` (mode 0600). The Python MCP server reads the same file and sends it as `X-API-Token`. Keep this file private.
+- **Host-header check** — requests whose `Host` isn't `127.0.0.1` / `localhost` are rejected (mitigates DNS-rebinding from a browser on the same machine).
+- **Rate-limited** — `/api/send` is capped at 30 requests per minute.
+- **Media path allowlist** — `send_message(media_path=...)` is restricted to the OS temp dir by default. To send files from other locations, set the `WHATSAPP_ALLOWED_MEDIA_DIRS` env var (colon- or comma-separated) before starting the bridge, e.g. `WHATSAPP_ALLOWED_MEDIA_DIRS=$HOME/Downloads:$HOME/Pictures go run main.go`.
+- **Private logs** — message content is only printed to stdout when the bridge is started with `--debug` (e.g. `go run main.go --debug`).
+- **Strict file perms** — `store/` is created `0700`, downloaded media files are written `0600`.
+
+Note: the REST API is still unauthenticated against the `root` user and any process running as you. Do not run the bridge on a shared/multi-user machine with untrusted accounts.
+
 ## Usage
 
 Once connected, you can interact with your WhatsApp contacts through Claude, leveraging Claude's AI capabilities in your WhatsApp conversations.
