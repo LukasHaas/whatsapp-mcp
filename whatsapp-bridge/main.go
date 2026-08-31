@@ -17,13 +17,14 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -54,7 +55,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite", "file:store/messages.db?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -666,13 +667,12 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the FULL path INCLUDING the query string: the query carries the
+	// signed parameters (oe expiry, oh origin hash, mms3, ...) that
+	// mmg.whatsapp.net requires. Stripping them makes the server answer 403
+	// even for valid, fresh media. whatsmeow appends its own
+	// "&hash=...&mms-type=...&__wa-mms=" params after it, which is fine.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -796,8 +796,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			ChatJID string `json:"chat_jid"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" {
-			// No specific chat - request general sync
-			requestHistorySync(client, messageStore)
+			// No specific chat - request general sync in the background and
+			// respond immediately (the full sync walks every known chat with
+			// a pause between requests, so it can take a couple of minutes).
+			go requestHistorySync(client, messageStore)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success": true,
 				"message": "General history sync requested.",
@@ -876,7 +878,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -901,6 +903,14 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+
+	// Advertise on-demand history sync support to the phone. whatsmeow's
+	// default DeviceProps leave OnDemandReady/CompleteOnDemandReady nil, so
+	// the phone never answers BuildHistorySyncRequest (on-demand sync). These
+	// props are sent during pairing/registration; for an already-paired device
+	// they take effect after the next re-pairing.
+	store.DeviceProps.HistorySyncConfig.OnDemandReady = proto.Bool(true)
+	store.DeviceProps.HistorySyncConfig.CompleteOnDemandReady = proto.Bool(true)
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -970,9 +980,32 @@ func main() {
 		}
 
 		// Print QR code for pairing with phone
+		var firstQR *whatsmeow.QRChannelItem
+		if item, ok := <-qrChan; ok {
+			firstQR = &item
+		}
+		if firstQR != nil && firstQR.Event == "code" {
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			fmt.Printf("RAW_QR:%s\n", firstQR.Code)
+			qrterminal.GenerateHalfBlock(firstQR.Code, qrterminal.L, os.Stdout)
+			if phone := os.Getenv("WA_PAIR_PHONE"); phone != "" {
+				go func() {
+					for client.Store.ID == nil {
+						pairCode, pairErr := client.PairPhone(context.Background(), phone, false, whatsmeow.PairClientChrome, "Chrome (Windows)")
+						if pairErr != nil {
+							logger.Errorf("PairPhone failed: %v", pairErr)
+							return
+						}
+						fmt.Printf("\nPAIR_CODE:%s\n", pairCode)
+						time.Sleep(80 * time.Second)
+					}
+				}()
+			}
+		}
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Printf("RAW_QR:%s\n", evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				fmt.Println("\nSuccessfully paired with WhatsApp!")
@@ -1007,6 +1040,10 @@ func main() {
 
 	// Send presence to ensure WhatsApp knows we're online and pushes pending sync data
 	client.SendPresence(context.Background(), types.PresenceAvailable)
+
+	// Auto-sync recent messages in the background, so messages that arrived
+	// while the bridge was offline get fetched on every (re)connect.
+	startAutoSync(client, messageStore)
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
@@ -1270,45 +1307,69 @@ func requestHistorySync(client *whatsmeow.Client, messageStore *MessageStore) {
 		return
 	}
 
-	// Get the oldest message we have to request more history before it
-	var oldestID, oldestChatJID string
-	var oldestTimestamp time.Time
-	var oldestIsFromMe bool
-
-	err := messageStore.db.QueryRow(`
-		SELECT id, chat_jid, timestamp, is_from_me
-		FROM messages
-		ORDER BY timestamp ASC
-		LIMIT 1
-	`).Scan(&oldestID, &oldestChatJID, &oldestTimestamp, &oldestIsFromMe)
-
+	// Request recent messages for every chat we already know, anchoring on
+	// "now". This fetches messages that arrived while the bridge was
+	// offline, which is what a user means by "sync" — the old behaviour
+	// (anchor on the oldest stored message, ask for history *before* it)
+	// only ever fetched older history, never recent missed messages.
+	chats, err := messageStore.GetChats()
 	if err != nil {
-		fmt.Printf("No messages found for history sync anchor: %v\n", err)
+		fmt.Printf("Failed to load chats for history sync: %v\n", err)
 		return
 	}
 
-	chatJID, err := types.ParseJID(oldestChatJID)
-	if err != nil {
-		fmt.Printf("Failed to parse JID for history sync: %v\n", err)
-		return
+	requested := 0
+	for chatJIDStr := range chats {
+		chatJID, err := types.ParseJID(chatJIDStr)
+		if err != nil {
+			fmt.Printf("Failed to parse JID %s for history sync: %v\n", chatJIDStr, err)
+			continue
+		}
+
+		// Synthetic anchor at "now" (same pattern as requestChatSync for
+		// chats without stored messages): the server then replies with the
+		// most recent messages of that chat.
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: false,
+			},
+			ID:        "FFFFFFFFFFFFFFFF",
+			Timestamp: time.Now(),
+		}
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
+		// Must be sent as a peer message (Peer: true) — BuildHistorySyncRequest
+		// builds a PEER_DATA_OPERATION request that the phone only answers when
+		// it arrives as a peer message. Sending it via plain SendMessage to our
+		// own JID silently drops the request, so no HistorySync event ever comes
+		// back and missed messages are never fetched.
+		_, err = client.SendPeerMessage(context.Background(), historyMsg)
+		if err != nil {
+			fmt.Printf("Failed to request history sync for %s: %v\n", chatJIDStr, err)
+			continue
+		}
+		requested++
+
+		// Small pause between requests: each peer message encrypts into the
+		// session store, and firing 700+ back-to-back caused SQLITE_BUSY
+		// (database is locked) write-storms on the sqlite session store.
+		time.Sleep(150 * time.Millisecond)
 	}
 
-	msgInfo := &types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     chatJID,
-			IsFromMe: oldestIsFromMe,
-		},
-		ID:        oldestID,
-		Timestamp: oldestTimestamp,
-	}
+	fmt.Printf("Requested recent history sync for %d chats.\n", requested)
+}
 
-	historyMsg := client.BuildHistorySyncRequest(msgInfo, 100)
-	_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested.")
-	}
+// startAutoSync kicks off a recent-message sync in the background shortly
+// after a (re)connection. This recovers messages that arrived while the
+// bridge was offline. It runs in its own goroutine so it never blocks the
+// REST server or the event loop.
+func startAutoSync(client *whatsmeow.Client, messageStore *MessageStore) {
+	go func() {
+		// Give WhatsApp a moment to push its own recent-sync first, then
+		// request on-demand history for every known chat.
+		time.Sleep(5 * time.Second)
+		requestHistorySync(client, messageStore)
+	}()
 }
 
 func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJIDStr string) error {
@@ -1345,7 +1406,7 @@ func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJ
 			Timestamp: oldestTimestamp,
 		}
 		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
-		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		_, err = client.SendPeerMessage(context.Background(), historyMsg)
 		if err != nil {
 			return fmt.Errorf("failed to send sync request: %v", err)
 		}
@@ -1361,7 +1422,7 @@ func requestChatSync(client *whatsmeow.Client, messageStore *MessageStore, chatJ
 			Timestamp: time.Now(),
 		}
 		historyMsg := client.BuildHistorySyncRequest(msgInfo, 50)
-		_, err = client.SendMessage(context.Background(), client.Store.ID.ToNonAD(), historyMsg)
+		_, err = client.SendPeerMessage(context.Background(), historyMsg)
 		if err != nil {
 			return fmt.Errorf("failed to send sync request: %v", err)
 		}
