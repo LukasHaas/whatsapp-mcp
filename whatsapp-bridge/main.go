@@ -203,7 +203,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,13 +362,56 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	storeSentMessage(client, messageStore, recipientJID, resp, msg, message, mediaPath)
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// storeSentMessage saves a message this bridge just sent. WhatsApp does not echo a client's own
+// messages back to it as events, so without this they never reach the database: list_messages and
+// anything reading messages.db would miss every message sent through the bridge.
+func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, recipientJID types.JID, resp whatsmeow.SendResponse, msg *waProto.Message, message string, mediaPath string) {
+	if messageStore == nil {
+		return
+	}
+	chatJID := recipientJID.ToNonAD()
+	chatJIDStr := chatJID.String()
+
+	// Own messages are stored under the same id WhatsApp uses in that chat: the LID in a LID chat,
+	// the phone number elsewhere (as events for messages sent from the phone are).
+	sender := ""
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	if chatJID.Server == types.HiddenUserServer && !client.Store.LID.IsEmpty() {
+		sender = client.Store.LID.User
+	}
+
+	timestamp := resp.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if mediaType == "document" && mediaPath != "" {
+		filename = filepath.Base(mediaPath)
+	}
+
+	logger := waLog.Stdout("Send", "WARN", true)
+	name := GetChatName(client, messageStore, chatJID, chatJIDStr, nil, sender, logger)
+	if err := messageStore.StoreChat(chatJIDStr, name, timestamp); err != nil {
+		logger.Warnf("Failed to store chat for sent message: %v", err)
+	}
+	if err := messageStore.StoreMessage(resp.ID, chatJIDStr, sender, message, timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		logger.Warnf("Failed to store sent message: %v", err)
+	}
 }
 
 // Extract media info from a message
@@ -706,7 +749,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
