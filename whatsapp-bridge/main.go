@@ -817,6 +817,42 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for a group's details: GET /api/group/info?jid=<...@g.us>. Answers
+	// {"success": true, "jid": "...", "name": "...", "participants": 5, "community": false}, where
+	// participants counts everyone in the group, the person included, or {"success": false, "message": "..."}.
+	// It asks WhatsApp each time; callers keep the answer for a while.
+	http.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		answer := func(status int, body map[string]interface{}) {
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(body)
+		}
+		jid, err := types.ParseJID(strings.TrimSpace(r.URL.Query().Get("jid")))
+		if err != nil || jid.Server != types.GroupServer {
+			answer(http.StatusBadRequest, map[string]interface{}{"success": false, "message": "jid must be a group (...@g.us)"})
+			return
+		}
+		if !client.IsConnected() {
+			answer(http.StatusServiceUnavailable, map[string]interface{}{"success": false, "message": "WhatsApp is not connected"})
+			return
+		}
+		info, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			// Also when the person is no longer in the group.
+			answer(http.StatusBadGateway, map[string]interface{}{"success": false, "message": fmt.Sprintf("WhatsApp gave no group info: %v", err)})
+			return
+		}
+		count := info.ParticipantCount
+		if len(info.Participants) > count {
+			count = len(info.Participants)
+		}
+		answer(http.StatusOK, map[string]interface{}{"success": true, "jid": jid.String(), "name": info.Name, "participants": count, "community": info.IsParent})
+	})
+
 	// Handler for triggering on-demand history sync for a specific chat
 	http.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
