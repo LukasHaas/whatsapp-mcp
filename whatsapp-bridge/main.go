@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -84,6 +85,17 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Emoji reactions: one per person per message ("me" for our own). Removed when taken back.
+		CREATE TABLE IF NOT EXISTS reactions (
+			chat_jid TEXT,
+			message_id TEXT,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (chat_jid, message_id, sender)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -120,6 +132,26 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// Store an emoji reaction to a message, or remove it when the emoji is empty (taken back).
+// Our own reactions are kept under the sender "me", whichever device sent them.
+func (store *MessageStore) StoreReaction(chatJID, messageID, sender, emoji string, timestamp time.Time, isFromMe bool) error {
+	if isFromMe {
+		sender = "me"
+	}
+	if chatJID == "" || messageID == "" || sender == "" {
+		return nil
+	}
+	if emoji == "" {
+		_, err := store.db.Exec("DELETE FROM reactions WHERE chat_jid = ? AND message_id = ? AND sender = ?", chatJID, messageID, sender)
+		return err
+	}
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO reactions (chat_jid, message_id, sender, emoji, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?)",
+		chatJID, messageID, sender, emoji, timestamp, isFromMe,
 	)
 	return err
 }
@@ -185,7 +217,21 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// A photo, video or file sent with words: the words are its caption, and are kept as the
+	// message's text next to the media. (A file with a caption comes wrapped in its own message.)
+	if image := msg.GetImageMessage(); image != nil {
+		return image.GetCaption()
+	}
+	if video := msg.GetVideoMessage(); video != nil {
+		return video.GetCaption()
+	}
+	if document := msg.GetDocumentMessage(); document != nil {
+		return document.GetCaption()
+	}
+	if wrapped := msg.GetDocumentWithCaptionMessage(); wrapped != nil {
+		return wrapped.GetMessage().GetDocumentMessage().GetCaption()
+	}
+
 	return ""
 }
 
@@ -464,6 +510,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// An emoji reaction to an earlier message: kept apart from the messages.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil && reaction.GetKey().GetID() != "" {
+		if err := messageStore.StoreReaction(chatJID, reaction.GetKey().GetID(), sender, reaction.GetText(), msg.Info.Timestamp, msg.Info.IsFromMe); err != nil {
+			logger.Warnf("Failed to store reaction: %v", err)
+		}
+		return
 	}
 
 	// Extract text content
@@ -818,8 +872,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for a group's details: GET /api/group/info?jid=<...@g.us>. Answers
-	// {"success": true, "jid": "...", "name": "...", "participants": 5, "community": false}, where
-	// participants counts everyone in the group, the person included, or {"success": false, "message": "..."}.
+	// {"success": true, "jid": "...", "name": "...", "participants": 5, "members": ["...@s.whatsapp.net", ...], "community": false},
+	// where participants counts everyone in the group, the person included, and members lists them, or
+	// {"success": false, "message": "..."}.
 	// It asks WhatsApp each time; callers keep the answer for a while.
 	http.HandleFunc("/api/group/info", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -850,7 +905,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if len(info.Participants) > count {
 			count = len(info.Participants)
 		}
-		answer(http.StatusOK, map[string]interface{}{"success": true, "jid": jid.String(), "name": info.Name, "participants": count, "community": info.IsParent})
+		// Everyone in the group, by phone number where WhatsApp tells it (a LID otherwise), so a
+		// group without a name can be called by who is in it.
+		members := make([]string, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			id := p.JID
+			if !p.PhoneNumber.IsEmpty() {
+				id = p.PhoneNumber
+			}
+			members = append(members, id.ToNonAD().String())
+		}
+		answer(http.StatusOK, map[string]interface{}{"success": true, "jid": jid.String(), "name": info.Name, "participants": count, "members": members, "community": info.IsParent})
 	})
 
 	// Handler for triggering on-demand history sync for a specific chat
@@ -899,6 +964,251 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"success": true,
 			"message": fmt.Sprintf("On-demand sync requested for %s. Messages will arrive shortly.", req.ChatJID),
 		})
+	})
+
+	// Handler for reacting to a message with an emoji (an empty emoji takes our reaction back).
+	// Body: {"chat_jid": "...", "message_id": "...", "emoji": "👍"}. Answers {"success": bool, "message": "..."}.
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		answer := func(status int, ok bool, message string) {
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: ok, Message: message})
+		}
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" || req.MessageID == "" {
+			answer(http.StatusBadRequest, false, "chat_jid and message_id are required")
+			return
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			answer(http.StatusBadRequest, false, "chat_jid is not a valid JID")
+			return
+		}
+		if !client.IsConnected() {
+			answer(http.StatusServiceUnavailable, false, "WhatsApp is not connected")
+			return
+		}
+		// Who wrote the message decides its key: ours, the other person's in a direct chat, or a
+		// group member's (who must be named as the participant, by phone number or LID).
+		var senderUser string
+		var fromMe bool
+		err = messageStore.db.QueryRow("SELECT sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?", req.MessageID, req.ChatJID).Scan(&senderUser, &fromMe)
+		if err != nil {
+			answer(http.StatusNotFound, false, "No such message in this chat")
+			return
+		}
+		var sender types.JID
+		switch {
+		case fromMe:
+			sender = *client.Store.ID
+		case chat.Server != types.GroupServer:
+			sender = chat
+		case strings.Contains(senderUser, "@"):
+			sender, _ = types.ParseJID(senderUser)
+		default:
+			sender = types.NewJID(senderUser, types.DefaultUserServer)
+			lid := types.NewJID(senderUser, types.HiddenUserServer)
+			if pn, lerr := client.Store.LIDs.GetPNForLID(context.Background(), lid); lerr == nil && !pn.IsEmpty() {
+				sender = lid
+			}
+		}
+		if _, err := client.SendMessage(context.Background(), chat, client.BuildReaction(chat, sender, req.MessageID, req.Emoji)); err != nil {
+			answer(http.StatusInternalServerError, false, fmt.Sprintf("WhatsApp did not take the reaction: %v", err))
+			return
+		}
+		if err := messageStore.StoreReaction(req.ChatJID, req.MessageID, "me", req.Emoji, time.Now(), true); err != nil {
+			fmt.Printf("Failed to store own reaction: %v\n", err)
+		}
+		answer(http.StatusOK, true, "Reaction sent")
+	})
+
+	// Handler for starting a new group: {"name": "Friday dinner", "participants": ["15551234567", ...]}.
+	// Participants are phone numbers with country code (digits, "+" and spaces allowed) or JIDs.
+	// Answers {"success": true, "jid": "...@g.us"} or {"success": false, "message": "..."}.
+	http.HandleFunc("/api/group/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		answer := func(status int, body map[string]interface{}) {
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(body)
+		}
+		var req struct {
+			Name         string   `json:"name"`
+			Participants []string `json:"participants"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" || len(req.Participants) < 1 {
+			answer(http.StatusBadRequest, map[string]interface{}{"success": false, "message": "name and participants are required"})
+			return
+		}
+		if len([]rune(req.Name)) > 25 {
+			answer(http.StatusBadRequest, map[string]interface{}{"success": false, "message": "WhatsApp group names have at most 25 characters"})
+			return
+		}
+		if !client.IsConnected() {
+			answer(http.StatusServiceUnavailable, map[string]interface{}{"success": false, "message": "WhatsApp is not connected"})
+			return
+		}
+		var participants []types.JID
+		for _, p := range req.Participants {
+			if strings.Contains(p, "@") {
+				jid, err := types.ParseJID(p)
+				if err != nil {
+					answer(http.StatusBadRequest, map[string]interface{}{"success": false, "message": fmt.Sprintf("not a valid JID: %s", p)})
+					return
+				}
+				participants = append(participants, jid)
+				continue
+			}
+			digits := strings.Map(func(r rune) rune {
+				if r >= '0' && r <= '9' {
+					return r
+				}
+				return -1
+			}, p)
+			if len(digits) < 7 {
+				answer(http.StatusBadRequest, map[string]interface{}{"success": false, "message": fmt.Sprintf("not a phone number with country code: %s", p)})
+				return
+			}
+			participants = append(participants, types.NewJID(digits, types.DefaultUserServer))
+		}
+		// Ask WhatsApp first: a number not on WhatsApp would silently be left out of the group.
+		var phones []string
+		for _, jid := range participants {
+			if jid.Server == types.DefaultUserServer {
+				phones = append(phones, "+"+jid.User)
+			}
+		}
+		if len(phones) > 0 {
+			checked, err := client.IsOnWhatsApp(context.Background(), phones)
+			if err != nil {
+				answer(http.StatusBadGateway, map[string]interface{}{"success": false, "message": fmt.Sprintf("WhatsApp did not say who is on WhatsApp: %v", err)})
+				return
+			}
+			var missing []string
+			for _, c := range checked {
+				if !c.IsIn {
+					missing = append(missing, c.Query)
+				}
+			}
+			if len(missing) > 0 {
+				answer(http.StatusUnprocessableEntity, map[string]interface{}{
+					"success": false, "not_on_whatsapp": missing,
+					"message": fmt.Sprintf("not on WhatsApp: %s", strings.Join(missing, ", ")),
+				})
+				return
+			}
+		}
+		info, err := client.CreateGroup(context.Background(), whatsmeow.ReqCreateGroup{Name: strings.TrimSpace(req.Name), Participants: participants})
+		if err != nil {
+			answer(http.StatusInternalServerError, map[string]interface{}{"success": false, "message": fmt.Sprintf("WhatsApp did not create the group: %v", err)})
+			return
+		}
+		jid := info.JID.String()
+		if err := messageStore.StoreChat(jid, info.Name, time.Now()); err != nil {
+			fmt.Printf("Failed to store new group chat: %v\n", err)
+		}
+		// Anyone WhatsApp did not add (their privacy settings, most often), and the invite link for them.
+		notAdded := []map[string]interface{}{}
+		for _, p := range info.Participants {
+			if p.Error == 0 {
+				continue
+			}
+			phone := p.PhoneNumber.User
+			if phone == "" {
+				phone = p.JID.User
+			}
+			reason := fmt.Sprintf("WhatsApp error %d", p.Error)
+			if p.Error == 403 || p.AddRequest != nil {
+				reason = "their privacy settings only allow an invite"
+			}
+			notAdded = append(notAdded, map[string]interface{}{"phone": phone, "reason": reason})
+		}
+		body := map[string]interface{}{"success": true, "jid": jid, "message": "Group created", "not_added": notAdded}
+		if len(notAdded) > 0 {
+			if link, err := client.GetGroupInviteLink(context.Background(), info.JID, false); err == nil {
+				body["invite_link"] = link
+			}
+		}
+		answer(http.StatusOK, body)
+	})
+
+	// Who is on WhatsApp: GET /api/onwhatsapp?phone=15551234567&phone=... answers
+	// {"success": true, "results": [{"phone": "...", "on_whatsapp": true, "jid": "...@s.whatsapp.net"}]}.
+	http.HandleFunc("/api/onwhatsapp", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var phones []string
+		for _, p := range r.URL.Query()["phone"] {
+			digits := strings.Map(func(c rune) rune {
+				if c >= '0' && c <= '9' {
+					return c
+				}
+				return -1
+			}, p)
+			if len(digits) >= 7 {
+				phones = append(phones, "+"+digits)
+			}
+		}
+		if len(phones) == 0 || !client.IsConnected() {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "give phone numbers with country code, while WhatsApp is connected"})
+			return
+		}
+		checked, err := client.IsOnWhatsApp(context.Background(), phones)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		results := []map[string]interface{}{}
+		for _, c := range checked {
+			results = append(results, map[string]interface{}{"phone": strings.TrimPrefix(c.Query, "+"), "on_whatsapp": c.IsIn, "jid": c.JID.String()})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "results": results})
+	})
+
+	// Handler for a contact's or group's profile photo: answers with where to download it and its id
+	// (which changes when the photo does), or {"url": null} when there is none or it is not visible to us.
+	http.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		jid, err := types.ParseJID(r.URL.Query().Get("jid"))
+		if err != nil || jid.User == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "A valid jid is required"})
+			return
+		}
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "Not connected to WhatsApp"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		info, err := client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: false})
+		if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) || errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) || (err == nil && info == nil) {
+			json.NewEncoder(w).Encode(map[string]interface{}{"url": nil})
+			return
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"url": info.URL, "id": info.ID})
 	})
 
 	// Start the server
@@ -1249,14 +1559,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Text, or the caption of a photo, video or file.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1269,6 +1573,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+
+				// Reactions others (or we) left on this message, as the history has them.
+				if targetID := msg.Message.GetKey().GetID(); targetID != "" {
+					for _, r := range msg.Message.GetReactions() {
+						reactor := r.GetKey().GetParticipant()
+						if reactor == "" {
+							reactor = jid.User
+						}
+						if at := r.GetSenderTimestampMS(); at > 0 {
+							messageStore.StoreReaction(chatJID, targetID, strings.Split(reactor, "@")[0], r.GetText(), time.UnixMilli(at), r.GetKey().GetFromMe())
+						}
+					}
+				}
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {

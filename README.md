@@ -30,6 +30,17 @@ Searching for "schroder" now finds "Schröder", "Munoz" finds "Muñoz", etc. All
 
 A new `/api/sync` endpoint on the Go bridge allows requesting history sync for specific chats. The bridge also sends presence on connect to help trigger pending sync data from WhatsApp.
 
+### Reactions, captions and more bridge endpoints
+
+The Go bridge keeps more of what a conversation holds, and its REST API (port 8080) can do a few more things:
+
+- **Reactions** are stored in a `reactions` table in `messages.db` (one row per person per message, removed when taken back), for live messages and history sync. `POST /api/react` with `{"chat_jid", "message_id", "emoji"}` reacts to a message; an empty emoji takes the reaction back.
+- **Captions** of photos, videos and documents are stored as the message's `content`, next to the media. Before, a media message had no text.
+- `POST /api/group/create` with `{"name", "participants"}` starts a group. Participants are phone numbers with country code, or JIDs. Numbers that are not on WhatsApp are reported instead of being left out silently, and anyone who can only be invited is listed with an invite link.
+- `GET /api/group/info?jid=<group JID>` also returns `members`, the JID of everyone in the group.
+- `GET /api/onwhatsapp?phone=<number>&phone=...` says which numbers are on WhatsApp.
+- `GET /api/avatar?jid=<JID>` returns where to download a contact's or group's profile photo, and its id.
+
 ## Installation
 
 ### Prerequisites
